@@ -89,6 +89,8 @@ LOG_MODULE_REGISTER(input_pmw3610, CONFIG_INPUT_LOG_LEVEL);
 #define PMW3610_DATA_SIZE_BITS 12
 
 #define RESET_DELAY_MS 10
+#define PROD_ID_RETRY_DELAY_MS 100
+#define PROD_ID_RETRY_COUNT 30
 #define INIT_OBSERVATION_DELAY_MS 10
 #define CLOCK_ON_DELAY_US 300
 
@@ -381,6 +383,23 @@ static int pmw3610_configure(const struct device *dev)
 	ret = pmw3610_read_reg(dev, PMW3610_PROD_ID, &val);
 	if (ret < 0) {
 		return ret;
+	}
+
+	/* After a cold power-up the sensor may not answer for ~1.3 s; keep resetting until it does. */
+	for (int i = 0; i < PROD_ID_RETRY_COUNT && val != PRODUCT_ID_PMW3610; i++) {
+		k_sleep(K_MSEC(PROD_ID_RETRY_DELAY_MS));
+
+		ret = pmw3610_write_reg(dev, PMW3610_POWER_UP_RESET, POWER_UP_RESET);
+		if (ret < 0) {
+			return ret;
+		}
+
+		k_sleep(K_MSEC(RESET_DELAY_MS));
+
+		ret = pmw3610_read_reg(dev, PMW3610_PROD_ID, &val);
+		if (ret < 0) {
+			return ret;
+		}
 	}
 
 	if (val != PRODUCT_ID_PMW3610) {
