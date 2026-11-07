@@ -8,3 +8,11 @@ config INPUT_PMW3610
 	select SPI
 	help
 	  PMW3610 low power laser mouse sensor input driver
+
+config INPUT_PMW3610_POLL_INTERVAL_MS
+	int "PMW3610 polling interval in ms (0 = use motion interrupt)"
+	default 0
+	depends on INPUT_PMW3610
+	help
+	  When non-zero, the driver ignores the MOTION pin and polls the
+	  sensor with a burst read every N milliseconds.

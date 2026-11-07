@@ -113,9 +113,10 @@ struct pmw3610_config {
 
 struct pmw3610_data {
 	const struct device *dev;
-	struct k_work motion_work;
+	struct k_work_delayable motion_work;
 	struct gpio_callback motion_cb;
 	bool smart_flag;
+	uint32_t motion_err_count;
 };
 
 static int pmw3610_read(const struct device *dev,
@@ -193,16 +194,24 @@ static int pmw3610_spi_clk_off(const struct device *dev)
 	return pmw3610_write_reg(dev, PMW3610_SPI_CLK_ON_REQ, SPI_CLOCK_ON_REQ_OFF);
 }
 
+static int pmw3610_motion_irq_enable(const struct device *dev, bool enable)
+{
+	const struct pmw3610_config *cfg = dev->config;
+
+	return gpio_pin_interrupt_configure_dt(&cfg->motion_gpio,
+			enable ? GPIO_INT_LEVEL_ACTIVE : GPIO_INT_DISABLE);
+}
+
 static void pmw3610_motion_work_handler(struct k_work *work)
 {
 	struct pmw3610_data *data = CONTAINER_OF(
-			work, struct pmw3610_data, motion_work);
+			k_work_delayable_from_work(work), struct pmw3610_data, motion_work);
 	const struct device *dev = data->dev;
 	const struct pmw3610_config *cfg = dev->config;
 	uint8_t burst_data[BURST_DATA_LEN_MAX];
 	uint8_t burst_data_len;
 	int32_t x, y;
-	int ret;
+	int ret = 0;
 
 	if (cfg->smart_mode) {
 		burst_data_len = BURST_DATA_LEN_SMART;
@@ -212,11 +221,11 @@ static void pmw3610_motion_work_handler(struct k_work *work)
 
 	ret = pmw3610_read(dev, PMW3610_BURST_READ, burst_data, burst_data_len);
 	if (ret < 0) {
-		return;
+		goto out;
 	}
 
 	if ((burst_data[BURST_MOTION] & MOTION_STATUS_MOTION) == 0x00) {
-		return;
+		goto out;
 	}
 
 	x = ((burst_data[BURST_DELTA_XY_H] << 4) & 0xf00) | burst_data[BURST_DELTA_X_L];
@@ -236,7 +245,7 @@ static void pmw3610_motion_work_handler(struct k_work *work)
 
 			ret = pmw3610_write_reg(dev, PMW3610_SMART_MODE, SMART_MODE_ENABLE);
 			if (ret < 0) {
-				return;
+				goto out;
 			}
 
 			pmw3610_spi_clk_off(dev);
@@ -247,13 +256,24 @@ static void pmw3610_motion_work_handler(struct k_work *work)
 
 			ret = pmw3610_write_reg(dev, PMW3610_SMART_MODE, SMART_MODE_DISABLE);
 			if (ret < 0) {
-				return;
+				goto out;
 			}
 
 			pmw3610_spi_clk_off(dev);
 
 			data->smart_flag = true;
 		}
+	}
+
+out:
+	if (ret < 0) {
+		LOG_WRN("Motion SPI error: %d (count: %u)", ret, ++data->motion_err_count);
+		k_work_reschedule(&data->motion_work, K_MSEC(10));
+	} else if (CONFIG_INPUT_PMW3610_POLL_INTERVAL_MS > 0) {
+		k_work_reschedule(&data->motion_work,
+				  K_MSEC(CONFIG_INPUT_PMW3610_POLL_INTERVAL_MS));
+	} else {
+		pmw3610_motion_irq_enable(dev, true);
 	}
 }
 
@@ -264,7 +284,8 @@ static void pmw3610_motion_handler(const struct device *gpio_dev,
 	struct pmw3610_data *data = CONTAINER_OF(
 			cb, struct pmw3610_data, motion_cb);
 
-	k_work_submit(&data->motion_work);
+	pmw3610_motion_irq_enable(data->dev, false);
+	k_work_reschedule(&data->motion_work, K_NO_WAIT);
 }
 
 int pmw3610_set_resolution(const struct device *dev, uint16_t res_cpi)
@@ -514,7 +535,7 @@ static int pmw3610_init(const struct device *dev)
 
 	data->dev = dev;
 
-	k_work_init(&data->motion_work, pmw3610_motion_work_handler);
+	k_work_init_delayable(&data->motion_work, pmw3610_motion_work_handler);
 
 	if (!gpio_is_ready_dt(&cfg->motion_gpio)) {
 		LOG_ERR("%s is not ready", cfg->motion_gpio.port->name);
@@ -542,12 +563,15 @@ static int pmw3610_init(const struct device *dev)
 		return ret;
 	}
 
-	ret = gpio_pin_interrupt_configure_dt(&cfg->motion_gpio,
-					      GPIO_INT_EDGE_TO_ACTIVE);
-	if (ret != 0) {
-		LOG_ERR("Motion interrupt configuration failed: %d", ret);
-		return ret;
+	if (CONFIG_INPUT_PMW3610_POLL_INTERVAL_MS == 0) {
+		ret = pmw3610_motion_irq_enable(dev, true);
+		if (ret != 0) {
+			LOG_ERR("Motion interrupt configuration failed: %d", ret);
+			return ret;
+		}
 	}
+
+	k_work_reschedule(&data->motion_work, K_NO_WAIT);
 
 	ret = pm_device_runtime_enable(dev);
 	if (ret < 0) {
@@ -566,6 +590,11 @@ static int pmw3610_pm_action(const struct device *dev,
 
 	switch (action) {
 	case PM_DEVICE_ACTION_SUSPEND:
+		ret = pmw3610_motion_irq_enable(dev, false);
+		if (ret < 0) {
+			return ret;
+		}
+
 		ret = pmw3610_write_reg(dev, PMW3610_SHUTDOWN, SHUTDOWN_ENABLE);
 		if (ret < 0) {
 			return ret;
@@ -573,6 +602,16 @@ static int pmw3610_pm_action(const struct device *dev,
 		break;
 	case PM_DEVICE_ACTION_RESUME:
 		ret = pmw3610_write_reg(dev, PMW3610_POWER_UP_RESET, POWER_UP_WAKEUP);
+		if (ret < 0) {
+			return ret;
+		}
+
+		if (CONFIG_INPUT_PMW3610_POLL_INTERVAL_MS == 0) {
+			ret = pmw3610_motion_irq_enable(dev, true);
+		} else {
+			ret = k_work_reschedule(&((struct pmw3610_data *)dev->data)->motion_work,
+						K_NO_WAIT);
+		}
 		if (ret < 0) {
 			return ret;
 		}
