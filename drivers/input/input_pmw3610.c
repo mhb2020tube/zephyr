@@ -109,6 +109,7 @@ struct pmw3610_config {
 	bool invert_y;
 	bool force_awake;
 	bool smart_mode;
+	uint16_t rotation_ccw_deg;
 };
 
 struct pmw3610_data {
@@ -117,7 +118,63 @@ struct pmw3610_data {
 	struct gpio_callback motion_cb;
 	bool smart_flag;
 	uint32_t motion_err_count;
+	/* Rotation: Q14 cos/sin and sub-count remainders carried between reports. */
+	int32_t rot_cos;
+	int32_t rot_sin;
+	int32_t rot_rem_x;
+	int32_t rot_rem_y;
 };
+
+#define ROT_Q 14
+
+/* sin(0..90 deg) in Q14 */
+static const int16_t pmw3610_sin_q14[91] = {
+	0, 286, 572, 857, 1143, 1428, 1713, 1997, 2280, 2563, 2845, 3126, 3406,
+	3686, 3964, 4240, 4516, 4790, 5063, 5334, 5604, 5872, 6138, 6402, 6664,
+	6924, 7182, 7438, 7692, 7943, 8192, 8438, 8682, 8923, 9162, 9397, 9630,
+	9860, 10087, 10311, 10531, 10749, 10963, 11174, 11381, 11585, 11786,
+	11982, 12176, 12365, 12551, 12733, 12911, 13085, 13255, 13421, 13583,
+	13741, 13894, 14044, 14189, 14330, 14466, 14598, 14726, 14849, 14968,
+	15082, 15191, 15296, 15396, 15491, 15582, 15668, 15749, 15826, 15897,
+	15964, 16026, 16083, 16135, 16182, 16225, 16262, 16294, 16322, 16344,
+	16362, 16374, 16382, 16384,
+};
+
+static int32_t pmw3610_sin_deg(int32_t deg)
+{
+	deg %= 360;
+	if (deg < 0) {
+		deg += 360;
+	}
+	if (deg <= 90) {
+		return pmw3610_sin_q14[deg];
+	} else if (deg <= 180) {
+		return pmw3610_sin_q14[180 - deg];
+	} else if (deg <= 270) {
+		return -pmw3610_sin_q14[deg - 180];
+	}
+	return -pmw3610_sin_q14[360 - deg];
+}
+
+/*
+ * Rotate (x, y) so that the pointer direction turns counter-clockwise by
+ * rotation_ccw_deg on screen (screen Y axis points down):
+ *   x' =  x*cos + y*sin
+ *   y' = -x*sin + y*cos
+ * Fractional parts are carried over so slow movement is not lost.
+ */
+static void pmw3610_rotate(struct pmw3610_data *data, int32_t *x, int32_t *y)
+{
+	int32_t rx = *x * data->rot_cos + *y * data->rot_sin + data->rot_rem_x;
+	int32_t ry = -*x * data->rot_sin + *y * data->rot_cos + data->rot_rem_y;
+	int32_t ox = rx >> ROT_Q;
+	int32_t oy = ry >> ROT_Q;
+
+	data->rot_rem_x = rx - (ox << ROT_Q);
+	data->rot_rem_y = ry - (oy << ROT_Q);
+	*x = ox;
+	*y = oy;
+}
 
 static int pmw3610_read(const struct device *dev,
 			uint8_t addr, uint8_t *value, uint8_t len)
@@ -233,6 +290,10 @@ static void pmw3610_motion_work_handler(struct k_work *work)
 
 	x = sign_extend(x, PMW3610_DATA_SIZE_BITS - 1);
 	y = sign_extend(y, PMW3610_DATA_SIZE_BITS - 1);
+
+	if (cfg->rotation_ccw_deg != 0) {
+		pmw3610_rotate(data, &x, &y);
+	}
 
 	input_report_rel(data->dev, cfg->axis_x, x, false, K_FOREVER);
 	input_report_rel(data->dev, cfg->axis_y, y, true, K_FOREVER);
@@ -534,6 +595,10 @@ static int pmw3610_init(const struct device *dev)
 	}
 
 	data->dev = dev;
+	data->rot_cos = pmw3610_sin_deg(cfg->rotation_ccw_deg + 90);
+	data->rot_sin = pmw3610_sin_deg(cfg->rotation_ccw_deg);
+	data->rot_rem_x = 0;
+	data->rot_rem_y = 0;
 
 	k_work_init_delayable(&data->motion_work, pmw3610_motion_work_handler);
 
@@ -643,7 +708,8 @@ static int pmw3610_pm_action(const struct device *dev,
 		.invert_y = DT_INST_PROP(n, invert_y),				\
 		.force_awake = DT_INST_PROP(n, force_awake),			\
 		.smart_mode = DT_INST_PROP(n, smart_mode),			\
-	};									\
+		.rotation_ccw_deg = DT_INST_PROP(n, rotation_ccw_deg),		\
+	};								\
 										\
 	static struct pmw3610_data pmw3610_data_##n;				\
 										\

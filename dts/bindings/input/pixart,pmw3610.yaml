@@ -50,6 +50,14 @@ properties:
     description: |
       Invert Y axis values.
 
+  rotation-ccw-deg:
+    type: int
+    default: 0
+    description: |
+      Rotate the reported motion counter-clockwise on screen by this many
+      degrees (0-359), applied in software after invert-x/invert-y. Use it
+      when the sensor is mounted at an arbitrary angle.
+
   force-awake:
     type: boolean
     description: |
